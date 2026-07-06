@@ -35,6 +35,10 @@ This one is deliberately small, single-user, and guard-railed by default.
 - 🧵 **Long output** is chunked to fit Telegram, with a live typing indicator.
 - 🧱 **Robust launch** — the CLI is invoked via `node <cli.js>`, so prompts full
   of quotes, `&&`, `%` and pipes are never mangled by a Windows `.cmd` shim.
+- 🎤 **Voice notes** are transcribed locally with Whisper (`faster-whisper`) —
+  no API key, nothing leaves your machine.
+- 🧠 **Conversation continuity** — context carries across messages via
+  `--continue`; `/new` starts a fresh session.
 
 ## How it works
 
@@ -90,6 +94,10 @@ project"*.
 | `ALLOW_ALL_TOOLS` | ⬜ | `true`/`false`. Needed for headless (unattended) runs |
 | `COPILOT_DENY_TOOLS` | ⬜ | Comma-separated tools Copilot may never use |
 | `REQUEST_TIMEOUT` | ⬜ | Seconds before a request is killed (default 900) |
+| `CONTINUE_SESSION` | ⬜ | Keep context across messages (default `true`) |
+| `ENABLE_VOICE` | ⬜ | Transcribe voice notes with local Whisper (default `true`) |
+| `WHISPER_MODEL` | ⬜ | `tiny`/`base`/`small`/`medium`/`large-v3` (default `small`) |
+| `WHISPER_LANGUAGE` | ⬜ | Force a language (e.g. `ru`). Empty = auto-detect |
 
 ## Security model — read this
 
@@ -108,8 +116,9 @@ Telegram messages. Treat it accordingly:
 
 ## Roadmap
 
-- 🎤 Voice notes → transcription → prompt (Whisper)
-- 🧠 Session continuity (`--continue` / `--resume`) for multi-turn chats
+- 🗣️ Voice replies (text-to-speech notes back)
+- 📝 Audit log of every prompt and action
+- 🚦 Per-hour request / AI-credit cap
 - ✅ Optional Telegram approval prompt for individual tool calls
 - 🐧 Linux/macOS launch scripts
 

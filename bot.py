@@ -22,6 +22,7 @@ import logging
 import os
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, Router, BaseMiddleware, F
@@ -49,11 +50,25 @@ def _get_bool(name: str, default: bool) -> bool:
     return val.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _get_int(name: str, default: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID", "0") or "0")
+ALLOWED_USER_ID = _get_int("ALLOWED_USER_ID", 0)
 COPILOT_MODEL = os.getenv("COPILOT_MODEL", "").strip()
 ALLOW_ALL_TOOLS = _get_bool("ALLOW_ALL_TOOLS", True)
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "900") or "900")
+CONTINUE_SESSION = _get_bool("CONTINUE_SESSION", True)
+REQUEST_TIMEOUT = _get_int("REQUEST_TIMEOUT", 900)
+ENABLE_VOICE = _get_bool("ENABLE_VOICE", True)
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small").strip() or "small"
+WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "").strip()
 
 _DEFAULT_DENY = (
     "shell(rm),shell(rmdir),shell(rd),shell(del),shell(Remove-Item),"
@@ -115,21 +130,28 @@ def _resolve_copilot_argv() -> list[str]:
 COPILOT_ARGV = _resolve_copilot_argv()
 
 
-def build_command(prompt: str) -> list[str]:
+_session_started = False
+
+
+def build_command(prompt: str, resume: bool) -> list[str]:
     args = list(COPILOT_ARGV) + ["-p", prompt, "--silent"]
     if COPILOT_MODEL:
         args += ["--model", COPILOT_MODEL]
     if ALLOW_ALL_TOOLS:
-        args.append("--allow-all-tools")
+        args += ["--allow-all-tools", "--allow-all-paths"]
     for tool in DENY_TOOLS:
         args += ["--deny-tool", tool]
+    if resume:
+        args.append("--continue")
     args += ["-C", str(WORKING_DIR)]
     return args
 
 
 async def run_copilot(prompt: str) -> str:
-    args = build_command(prompt)
-    log.info("copilot -p %r (deny=%d tools)", prompt[:80], len(DENY_TOOLS))
+    global _session_started
+    resume = CONTINUE_SESSION and _session_started
+    args = build_command(prompt, resume=resume)
+    log.info("copilot -p %r (resume=%s, deny=%d)", prompt[:80], resume, len(DENY_TOOLS))
     proc = await asyncio.create_subprocess_exec(
         *args,
         stdout=asyncio.subprocess.PIPE,
@@ -143,6 +165,8 @@ async def run_copilot(prompt: str) -> str:
         await proc.wait()
         return f"\u23f1 Timed out after {REQUEST_TIMEOUT}s."
 
+    if proc.returncode == 0:
+        _session_started = True
     text = stdout.decode("utf-8", errors="replace").strip()
     if not text:
         return "(empty response)"
@@ -199,6 +223,46 @@ async def send_long(message: Message, text: str) -> None:
 
 
 run_lock = asyncio.Lock()
+_whisper_model = None
+
+
+async def _get_whisper():
+    global _whisper_model
+    if _whisper_model is None:
+        from faster_whisper import WhisperModel
+
+        loop = asyncio.get_running_loop()
+        log.info("Loading Whisper model %r (first use)\u2026", WHISPER_MODEL)
+        _whisper_model = await loop.run_in_executor(
+            None,
+            lambda: WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8"),
+        )
+    return _whisper_model
+
+
+async def transcribe(path: str) -> str:
+    model = await _get_whisper()
+    loop = asyncio.get_running_loop()
+
+    def _run() -> str:
+        segments, _info = model.transcribe(path, language=WHISPER_LANGUAGE or None)
+        return " ".join(seg.text for seg in segments).strip()
+
+    return await loop.run_in_executor(None, _run)
+
+
+async def process_prompt(message: Message, bot: Bot, prompt: str) -> None:
+    if run_lock.locked():
+        await message.answer("\u23f3 Still working on the previous request\u2026")
+    async with run_lock:
+        stop = asyncio.Event()
+        typing = asyncio.create_task(_keep_typing(bot, message.chat.id, stop))
+        try:
+            result = await run_copilot(prompt)
+        finally:
+            stop.set()
+            await typing
+        await send_long(message, result)
 
 
 @router.message(CommandStart())
@@ -220,6 +284,7 @@ async def on_help(message: Message) -> None:
         f"`{WORKING_DIR}`.\n\n"
         "/start  \u2013 status banner\n"
         "/status \u2013 current configuration\n"
+        "/new    \u2013 reset conversation context\n"
         "/help   \u2013 this message",
     )
 
@@ -237,37 +302,57 @@ async def on_status(message: Message) -> None:
     )
 
 
+@router.message(Command("new"))
+async def on_new(message: Message) -> None:
+    global _session_started
+    _session_started = False
+    await message.answer("\U0001f504 Fresh conversation \u2014 context reset.")
+
+
 @router.message(F.voice | F.audio)
-async def on_voice(message: Message) -> None:
-    await message.answer(
-        "\U0001f3a4 Voice input is on the roadmap. For now, please send text.",
-    )
+async def on_voice(message: Message, bot: Bot) -> None:
+    if not ENABLE_VOICE:
+        await message.answer("\U0001f3a4 Voice is disabled (set ENABLE_VOICE=true).")
+        return
+    media = message.voice or message.audio
+    tmp = os.path.join(tempfile.gettempdir(), f"tgvoice_{message.message_id}.oga")
+    try:
+        await bot.download(media, destination=tmp)
+        await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+        text = await transcribe(tmp)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("voice transcription failed")
+        await message.answer(f"\U0001f3a4 Transcription failed: {exc}")
+        return
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    if not text:
+        await message.answer("\U0001f3a4 Couldn't make out any speech.")
+        return
+    await message.answer(f"\U0001f3a4 heard: {text}")
+    await process_prompt(message, bot, text)
 
 
 @router.message(F.text & ~F.text.startswith("/"))
 async def on_text(message: Message, bot: Bot) -> None:
-    prompt = message.text or ""
-    if run_lock.locked():
-        await message.answer("\u23f3 Still working on the previous request\u2026")
-    async with run_lock:
-        stop = asyncio.Event()
-        typing = asyncio.create_task(_keep_typing(bot, message.chat.id, stop))
-        try:
-            result = await run_copilot(prompt)
-        finally:
-            stop.set()
-            await typing
-        await send_long(message, result)
+    await process_prompt(message, bot, message.text or "")
 
 
 # --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
 async def main() -> None:
-    if not TELEGRAM_BOT_TOKEN:
-        raise SystemExit("TELEGRAM_BOT_TOKEN is missing (set it in .env).")
+    if not TELEGRAM_BOT_TOKEN or "PASTE_YOUR" in TELEGRAM_BOT_TOKEN:
+        raise SystemExit(
+            "Set TELEGRAM_BOT_TOKEN in .env (get it from @BotFather)."
+        )
     if not ALLOWED_USER_ID:
-        raise SystemExit("ALLOWED_USER_ID is missing (set it in .env).")
+        raise SystemExit(
+            "Set ALLOWED_USER_ID in .env to your numeric id (from @userinfobot)."
+        )
 
     bot = Bot(TELEGRAM_BOT_TOKEN)
     dp = Dispatcher()

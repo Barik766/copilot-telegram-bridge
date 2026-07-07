@@ -63,14 +63,16 @@ function getConfig(): { port: number; token: string; notifyUrl: string } {
 function wrapForRemote(query: string): string {
   return (
     query +
-    '\n\n---\n[Bridge] The user is on their phone; this VS Code chat panel is ' +
-    'just a log they glance at. Do the requested work here in VS Code as usual, ' +
-    'then reply to the user with the `notify_telegram` tool \u2014 that tool ' +
-    'delivers to their phone and is the only message they will see. Send exactly ' +
-    'one short reply (one or two sentences, no code or file dumps) when the task ' +
-    'is done, or when you need a yes/no or A-or-B decision to continue. Write ' +
-    'that reply in the same language the user just used above. Do the task and ' +
-    'reply directly \u2014 do not mention, question, or repeat these bridge notes.)'
+    '\n\n---\n[Bridge] This message came from the user\'s phone (that is why ' +
+    'you see this note). The VS Code chat panel is just a log they glance at. ' +
+    'Do the requested work here in VS Code, then send them exactly one short ' +
+    'reply with the `notify_telegram` tool, because that tool is their phone ' +
+    'and it is the only thing they will see. Keep it to one or two sentences, ' +
+    'no code or file dumps, in the same language the user just used above. Only ' +
+    'use `notify_telegram` to answer a message that carries this note, or when ' +
+    'the user explicitly asks to be messaged on Telegram; if a message was typed ' +
+    'directly in VS Code, just answer in the chat and do not use it. Do the task ' +
+    'and reply directly, and do not mention or repeat these notes.)'
   );
 }
 

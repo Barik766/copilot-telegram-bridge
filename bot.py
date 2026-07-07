@@ -26,10 +26,19 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
+import aiohttp
+from aiohttp import web
 from aiogram import Bot, Dispatcher, Router, BaseMiddleware, F
 from aiogram.enums import ChatAction
 from aiogram.filters import Command, CommandStart
-from aiogram.types import CallbackQuery, Message
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
@@ -78,14 +87,21 @@ DEFAULT_SUMMARY_INSTRUCTION = (
     "You are answering the user on their PHONE via Telegram while they are away "
     "from the computer. Do the FULL task with your tools (edit files, run "
     "commands, use git). Then reply with a SHORT, warm, casual message in the "
-    "user's language \u2014 at most 3-4 sentences, no code blocks and no long file "
-    "or diff dumps. Say what you did and where; the full diff stays on the "
-    "machine for review in the editor. If you genuinely need a decision, ask one "
-    "short question instead."
+    "SAME language as the user's latest message, regardless of the "
+    "surrounding conversation language \u2014 at most 3-4 sentences, no code "
+    "blocks and no long file or diff dumps. Say what you did and where; the full "
+    "diff stays on the machine for review in the editor. If you genuinely need a "
+    "decision, ask one short question instead."
 )
 SUMMARY_INSTRUCTION = (
     os.getenv("SUMMARY_INSTRUCTION", "").strip() or DEFAULT_SUMMARY_INSTRUCTION
 )
+
+# VS Code bridge: push prompts into the real VS Code Copilot chat via the extension.
+BRIDGE_URL = os.getenv("BRIDGE_URL", "http://127.0.0.1:8765").rstrip("/")
+BRIDGE_TOKEN = os.getenv("BRIDGE_TOKEN", "").strip()
+VSCODE_MODE = _get_bool("VSCODE_MODE", False)
+NOTIFY_PORT = _get_int("NOTIFY_PORT", 8766)
 
 _DEFAULT_DENY = (
     "shell(rm),shell(rmdir),shell(rd),shell(del),shell(Remove-Item),"
@@ -151,6 +167,44 @@ _session_started = False
 summary_enabled = SUMMARY_MODE
 active_workdir = WORKING_DIR
 active_resume_id: str | None = None
+vscode_mode = VSCODE_MODE
+active_persona: str | None = None
+deletable_ids: list[int] = []
+
+PERSONAS: dict[str, tuple[str, str]] = {
+    "friendly": (
+        "\U0001f60a Friendly",
+        "Warm, upbeat and casual, like a supportive buddy.",
+    ),
+    "critic": (
+        "\U0001f9d0 Critic",
+        "A sharp, skeptical critic: challenge my assumptions and point out flaws, "
+        "risks and weak spots bluntly and honestly.",
+    ),
+    "perfectionist": (
+        "\U0001f913 Perfectionist",
+        "A meticulous, obsessive perfectionist: dig deep, chase edge cases, and "
+        "refuse to leave anything sloppy or half-done.",
+    ),
+    "concise": (
+        "\u26a1 Concise",
+        "Terse and to the point. Minimal words, no fluff.",
+    ),
+}
+
+
+def _track(msg: Message | None) -> None:
+    if msg is not None:
+        deletable_ids.append(msg.message_id)
+        if len(deletable_ids) > 800:
+            del deletable_ids[:400]
+
+
+def _apply_persona(prompt: str) -> str:
+    if active_persona and active_persona in PERSONAS:
+        instr = PERSONAS[active_persona][1]
+        return f"[Persona for how you talk to me: {instr}]\n\n{prompt}"
+    return prompt
 
 
 def build_command(prompt: str) -> list[str]:
@@ -244,7 +298,7 @@ async def send_long(message: Message, text: str) -> None:
             nl = chunk.rfind("\n")
             if nl > TELEGRAM_LIMIT // 2:
                 chunk = chunk[:nl]
-        await message.answer(chunk)
+        _track(await message.answer(chunk))
         text = text[len(chunk):].lstrip("\n")
 
 
@@ -277,9 +331,47 @@ async def transcribe(path: str) -> str:
     return await loop.run_in_executor(None, _run)
 
 
+async def inject_vscode(prompt: str) -> tuple[bool, str]:
+    payload: dict = {"prompt": prompt}
+    if BRIDGE_TOKEN:
+        payload["token"] = BRIDGE_TOKEN
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(f"{BRIDGE_URL}/inject", json=payload) as resp:
+                data = await resp.json(content_type=None)
+                if resp.status == 200 and data.get("ok"):
+                    return True, str(data.get("via", ""))
+                return False, str(data.get("error", f"HTTP {resp.status}"))
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)
+
+
+async def bridge_new_chat() -> None:
+    payload: dict = {"token": BRIDGE_TOKEN} if BRIDGE_TOKEN else {}
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            await session.post(f"{BRIDGE_URL}/new", json=payload)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def process_prompt(message: Message, bot: Bot, prompt: str) -> None:
+    _track(message)
+    prompt = _apply_persona(prompt)
+    if vscode_mode:
+        ok, info = await inject_vscode(prompt)
+        if not ok:
+            _track(
+                await message.answer(
+                    f"\u26a0 VS Code bridge unreachable: {info}\n"
+                    "Is VS Code open with the extension running (toast on :8765)?"
+                )
+            )
+        return
     if run_lock.locked():
-        await message.answer("\u23f3 Still working on the previous request\u2026")
+        _track(await message.answer("\u23f3 Still working on the previous request\u2026"))
     async with run_lock:
         stop = asyncio.Event()
         typing = asyncio.create_task(_keep_typing(bot, message.chat.id, stop))
@@ -291,16 +383,227 @@ async def process_prompt(message: Message, bot: Bot, prompt: str) -> None:
         await send_long(message, result)
 
 
+MENU_KB = ReplyKeyboardMarkup(
+    keyboard=[
+        [
+            KeyboardButton(text="\u2630 Menu"),
+            KeyboardButton(text="\U0001f9f9 Clear"),
+        ]
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+
+def build_menu():
+    mode = "brief" if summary_enabled else "raw"
+    target = "VS Code" if vscode_mode else "CLI"
+    persona = PERSONAS[active_persona][0] if active_persona in PERSONAS else "Default"
+    sess = active_resume_id[:8] if active_resume_id else "new / latest"
+    text = (
+        "\U0001f916 <b>Claudy</b> \u2014 your Copilot on the phone\n\n"
+        f"\U0001f3af Target: <b>{target}</b>\n"
+        f"\U0001f3ad Persona: <b>{persona}</b>\n"
+        f"\U0001f4c1 Workspace: <code>{active_workdir.name}</code>\n"
+        f"\U0001f5c2 Session: <code>{sess}</code>\n"
+        f"\U0001f9fe Mode: <b>{mode}</b>\n\n"
+        "Send a message or a voice note \u2014 or use the buttons:"
+    )
+    b = InlineKeyboardBuilder()
+    b.row(
+        InlineKeyboardButton(text=f"\U0001f3af Target: {target}", callback_data="menu:target"),
+    )
+    b.row(
+        InlineKeyboardButton(text="\U0001f4c1 Workspace", callback_data="menu:workspace"),
+        InlineKeyboardButton(text="\U0001f5c2 Sessions", callback_data="menu:sessions"),
+    )
+    b.row(
+        InlineKeyboardButton(text="\U0001f3ad Persona", callback_data="menu:persona"),
+        InlineKeyboardButton(text=f"\U0001f9fe Mode: {mode}", callback_data="menu:mode"),
+    )
+    b.row(
+        InlineKeyboardButton(text="\U0001f195 New chat", callback_data="menu:new"),
+        InlineKeyboardButton(text="\U0001f9f9 Clear chat", callback_data="menu:clear"),
+    )
+    b.row(InlineKeyboardButton(text="\u2753 Help", callback_data="menu:help"))
+    return text, b.as_markup()
+
+
+async def _safe_edit(cb: CallbackQuery, text: str, markup=None) -> None:
+    try:
+        await cb.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e).lower():
+            return
+        await cb.message.answer(text, reply_markup=markup, parse_mode="HTML")
+
+
 @router.message(CommandStart())
 async def on_start(message: Message) -> None:
     await message.answer(
-        "\U0001f916 *Copilot bridge is online.*\n\n"
-        f"Working directory: `{WORKING_DIR}`\n"
-        f"Model: `{COPILOT_MODEL or 'default'}`\n"
-        f"Denied tools: `{len(DENY_TOOLS)}`\n\n"
-        "Send me a message and the Copilot agent will work on your machine.\n"
-        "Commands: /status  /help",
+        "\U0001f916 Claudy is online. Tap \u2630 Menu anytime.",
+        reply_markup=MENU_KB,
     )
+    text, markup = build_menu()
+    await message.answer(text, reply_markup=markup, parse_mode="HTML")
+
+
+@router.message(Command("menu"))
+async def on_menu_cmd(message: Message) -> None:
+    text, markup = build_menu()
+    await message.answer(text, reply_markup=markup, parse_mode="HTML")
+
+
+@router.message(F.text == "\u2630 Menu")
+async def on_menu_btn(message: Message) -> None:
+    text, markup = build_menu()
+    await message.answer(text, reply_markup=markup, parse_mode="HTML")
+
+
+@router.message(F.text == "\U0001f9f9 Clear")
+async def on_clear_btn(message: Message, bot: Bot) -> None:
+    tap_id = message.message_id
+    await _do_clear(message.chat.id, bot)
+    try:
+        await bot.delete_message(message.chat.id, tap_id)
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data == "menu:home")
+async def cb_home(cb: CallbackQuery) -> None:
+    text, markup = build_menu()
+    await _safe_edit(cb, text, markup)
+    await cb.answer()
+
+
+@router.callback_query(F.data == "menu:workspace")
+async def cb_workspace(cb: CallbackQuery) -> None:
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text=f"\U0001f4c1 {WORKING_DIR.name} (all)", callback_data="ws:*"))
+    if WORKING_DIR.is_dir():
+        subdirs = sorted(
+            d for d in WORKING_DIR.iterdir()
+            if d.is_dir() and not d.name.startswith(".")
+        )
+        for d in subdirs[:16]:
+            b.row(InlineKeyboardButton(text=d.name, callback_data=f"ws:{d.name}"))
+    b.row(InlineKeyboardButton(text="\U0001f3e0 Back", callback_data="menu:home"))
+    await _safe_edit(cb, "\U0001f4c1 Choose a workspace (folder the agent works in):", b.as_markup())
+    await cb.answer()
+
+
+@router.callback_query(F.data == "menu:sessions")
+async def cb_sessions(cb: CallbackQuery) -> None:
+    loop = asyncio.get_running_loop()
+    sessions = await loop.run_in_executor(None, list_sessions, 10)
+    b = InlineKeyboardBuilder()
+    for sid, title, mtime in sessions:
+        ts = datetime.fromtimestamp(mtime).strftime("%m-%d %H:%M")
+        b.row(InlineKeyboardButton(text=f"{title} \u00b7 {ts}", callback_data=f"sess:{sid}"))
+    b.row(InlineKeyboardButton(text="\U0001f195 New chat", callback_data="menu:new"))
+    b.row(InlineKeyboardButton(text="\U0001f3e0 Back", callback_data="menu:home"))
+    head = (
+        "\U0001f5c2 Your Copilot CLI sessions (this bot's history \u2014 separate "
+        "from VS Code chats):"
+        if sessions
+        else "No sessions yet \u2014 send a message to start one."
+    )
+    await _safe_edit(cb, head, b.as_markup())
+    await cb.answer()
+
+
+@router.callback_query(F.data == "menu:mode")
+async def cb_mode(cb: CallbackQuery) -> None:
+    global summary_enabled
+    summary_enabled = not summary_enabled
+    text, markup = build_menu()
+    await _safe_edit(cb, text, markup)
+    await cb.answer("brief" if summary_enabled else "raw")
+
+
+@router.callback_query(F.data == "menu:target")
+async def cb_target(cb: CallbackQuery) -> None:
+    global vscode_mode
+    vscode_mode = not vscode_mode
+    text, markup = build_menu()
+    await _safe_edit(cb, text, markup)
+    await cb.answer("VS Code" if vscode_mode else "CLI")
+
+
+@router.callback_query(F.data == "menu:persona")
+async def cb_persona(cb: CallbackQuery) -> None:
+    b = InlineKeyboardBuilder()
+    for key, (label, _instr) in PERSONAS.items():
+        mark = " \u2713" if key == active_persona else ""
+        b.row(InlineKeyboardButton(text=f"{label}{mark}", callback_data=f"persona:{key}"))
+    b.row(InlineKeyboardButton(text="Default", callback_data="persona:none"))
+    b.row(InlineKeyboardButton(text="\U0001f3e0 Back", callback_data="menu:home"))
+    await _safe_edit(cb, "\U0001f3ad Pick how the agent talks to you:", b.as_markup())
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("persona:"))
+async def cb_pick_persona(cb: CallbackQuery) -> None:
+    global active_persona
+    key = cb.data.split(":", 1)[1]
+    active_persona = None if key == "none" else key
+    text, markup = build_menu()
+    await _safe_edit(cb, text, markup)
+    label = PERSONAS[active_persona][0] if active_persona in PERSONAS else "Default"
+    await cb.answer(label)
+
+
+async def _do_clear(chat_id: int, bot: Bot) -> int:
+    ids = list(deletable_ids)
+    deletable_ids.clear()
+    deleted = 0
+    for mid in ids:
+        try:
+            await bot.delete_message(chat_id, mid)
+            deleted += 1
+        except Exception:
+            pass
+    return deleted
+
+
+@router.callback_query(F.data == "menu:clear")
+async def cb_clear(cb: CallbackQuery, bot: Bot) -> None:
+    deleted = await _do_clear(cb.message.chat.id, bot)
+    await cb.answer(f"Cleared {deleted}")
+    text, markup = build_menu()
+    await _safe_edit(cb, text, markup)
+
+
+@router.callback_query(F.data == "menu:new")
+async def cb_new(cb: CallbackQuery) -> None:
+    global active_resume_id, _session_started
+    active_resume_id = None
+    _session_started = False
+    if vscode_mode:
+        await bridge_new_chat()
+    text, markup = build_menu()
+    await _safe_edit(cb, text, markup)
+    await cb.answer("New chat")
+
+
+@router.callback_query(F.data == "menu:help")
+async def cb_help(cb: CallbackQuery) -> None:
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="\U0001f3e0 Back", callback_data="menu:home"))
+    txt = (
+        "\u2753 <b>How Claudy works</b>\n\n"
+        "\u2022 Send text or a voice note \u2192 the Copilot agent works in your "
+        "chosen workspace and replies with a short summary.\n"
+        "\u2022 \U0001f9fe <b>Mode</b>: brief (phone summary) \u2194 raw (full output).\n"
+        "\u2022 \U0001f4c1 <b>Workspace</b>: which project the agent touches.\n"
+        "\u2022 \U0001f5c2 <b>Sessions</b>: resume a previous conversation.\n"
+        "\u2022 \U0001f195 <b>New chat</b>: start fresh.\n\n"
+        "Sessions are stored by Copilot CLI in ~/.copilot/session-state \u2014 "
+        "separate from your VS Code chats (different app, different store)."
+    )
+    await _safe_edit(cb, txt, b.as_markup())
+    await cb.answer()
 
 
 @router.message(Command("help"))
@@ -360,46 +663,43 @@ async def on_raw(message: Message) -> None:
 COPILOT_SESSIONS_DIR = Path.home() / ".copilot" / "session-state"
 
 
-def _session_title(session_dir: Path) -> str:
+def _session_first_message(session_dir: Path) -> str | None:
+    events = session_dir / "events.jsonl"
+    if not events.is_file():
+        return None
     try:
-        files = sorted(
-            (p for p in session_dir.iterdir() if p.is_file()),
-            key=lambda p: p.stat().st_size,
-            reverse=True,
-        )
-        for f in files:
-            try:
-                with f.open("r", encoding="utf-8", errors="ignore") as fh:
-                    for line in fh:
-                        if '"user' not in line:
-                            continue
-                        try:
-                            obj = json.loads(line)
-                        except Exception:
-                            continue
-                        if str(obj.get("type", "")).startswith("user"):
-                            content = obj.get("data", {}).get("content", "")
-                            if isinstance(content, list):
-                                content = " ".join(
-                                    p.get("text", "") if isinstance(p, dict) else str(p)
-                                    for p in content
-                                )
-                            content = str(content).split("\n\n---")[0].strip()
-                            if content:
-                                return content[:48]
-            except Exception:
-                continue
+        with events.open("r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                if '"user.message"' not in line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if obj.get("type") == "user.message":
+                    content = str(obj.get("data", {}).get("content", ""))
+                    content = content.split("\n\n---")[0]
+                    content = " ".join(content.split())
+                    return content or None
     except Exception:
-        pass
-    return "(untitled)"
+        return None
+    return None
 
 
-def list_sessions(limit: int = 8) -> list[tuple[str, str, float]]:
+def list_sessions(limit: int = 10) -> list[tuple[str, str, float]]:
     if not COPILOT_SESSIONS_DIR.is_dir():
         return []
     dirs = [d for d in COPILOT_SESSIONS_DIR.iterdir() if d.is_dir()]
     dirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
-    return [(d.name, _session_title(d), d.stat().st_mtime) for d in dirs[:limit]]
+    out: list[tuple[str, str, float]] = []
+    for d in dirs:
+        title = _session_first_message(d)
+        if not title:
+            continue
+        out.append((d.name, title[:40], d.stat().st_mtime))
+        if len(out) >= limit:
+            break
+    return out
 
 
 @router.message(Command("sessions"))
@@ -425,14 +725,12 @@ async def on_pick_session(cb: CallbackQuery) -> None:
     if val == "new":
         active_resume_id = None
         _session_started = False
-        await cb.answer("New session")
-        await cb.message.answer("\U0001f195 New session \u2014 send your first message.")
+        await cb.answer("New chat")
     else:
         active_resume_id = val
         await cb.answer("Resumed")
-        await cb.message.answer(
-            f"\u25b6\ufe0f Resumed {val[:8]}. Ask away, e.g. \u00abна \u0447\u0451м остановились?\u00bb"
-        )
+    text, markup = build_menu()
+    await _safe_edit(cb, text, markup)
 
 
 @router.message(Command("workspace"))
@@ -457,10 +755,9 @@ async def on_pick_workspace(cb: CallbackQuery) -> None:
     active_workdir = WORKING_DIR if name == "*" else (WORKING_DIR / name)
     active_resume_id = None
     _session_started = False
-    await cb.answer("Workspace set")
-    await cb.message.answer(
-        f"\U0001f4c1 Workspace: {active_workdir}\nNow /sessions or just send a message."
-    )
+    await cb.answer(f"Workspace: {active_workdir.name}")
+    text, markup = build_menu()
+    await _safe_edit(cb, text, markup)
 
 
 @router.message(F.voice | F.audio)
@@ -486,11 +783,16 @@ async def on_voice(message: Message, bot: Bot) -> None:
     if not text:
         await message.answer("\U0001f3a4 Couldn't make out any speech.")
         return
-    await message.answer(f"\U0001f3a4 heard: {text}")
+    _track(await message.answer(f"\U0001f3a4 \u00ab{text}\u00bb"))
     await process_prompt(message, bot, text)
 
 
-@router.message(F.text & ~F.text.startswith("/"))
+@router.message(
+    F.text
+    & ~F.text.startswith("/")
+    & (F.text != "\u2630 Menu")
+    & (F.text != "\U0001f9f9 Clear")
+)
 async def on_text(message: Message, bot: Bot) -> None:
     await process_prompt(message, bot, message.text or "")
 
@@ -498,6 +800,32 @@ async def on_text(message: Message, bot: Bot) -> None:
 # --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
+async def _start_notify_server(bot: Bot) -> None:
+    async def handle(request: web.Request) -> web.Response:
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "bad json"}, status=400)
+        if BRIDGE_TOKEN and str(data.get("token", "")) != BRIDGE_TOKEN:
+            return web.json_response({"ok": False, "error": "bad token"}, status=401)
+        text = str(data.get("text", "")).strip()[:4000]
+        if text:
+            try:
+                sent = await bot.send_message(ALLOWED_USER_ID, f"\U0001f5a5\ufe0f {text}")
+                _track(sent)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("notify send failed: %s", exc)
+        return web.json_response({"ok": True})
+
+    app = web.Application()
+    app.router.add_post("/notify", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", NOTIFY_PORT)
+    await site.start()
+    log.info("Notify server on 127.0.0.1:%d", NOTIFY_PORT)
+
+
 async def main() -> None:
     if not TELEGRAM_BOT_TOKEN or "PASTE_YOUR" in TELEGRAM_BOT_TOKEN:
         raise SystemExit(
@@ -512,6 +840,8 @@ async def main() -> None:
     dp = Dispatcher()
     dp.message.middleware(AuthMiddleware(ALLOWED_USER_ID))
     dp.include_router(router)
+
+    await _start_notify_server(bot)
 
     log.info("Whitelisted user id: %s", ALLOWED_USER_ID)
     log.info("Copilot sandbox: %s", WORKING_DIR)

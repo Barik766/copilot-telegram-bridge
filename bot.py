@@ -400,23 +400,26 @@ def build_menu():
     target = "VS Code" if vscode_mode else "CLI"
     persona = PERSONAS[active_persona][0] if active_persona in PERSONAS else "Default"
     sess = active_resume_id[:8] if active_resume_id else "new / latest"
-    text = (
-        "\U0001f916 <b>Claudy</b> \u2014 your Copilot on the phone\n\n"
-        f"\U0001f3af Target: <b>{target}</b>\n"
-        f"\U0001f3ad Persona: <b>{persona}</b>\n"
-        f"\U0001f4c1 Workspace: <code>{active_workdir.name}</code>\n"
-        f"\U0001f5c2 Session: <code>{sess}</code>\n"
-        f"\U0001f9fe Mode: <b>{mode}</b>\n\n"
-        "Send a message or a voice note \u2014 or use the buttons:"
-    )
+    lines = [
+        "\U0001f916 <b>Claudy</b> \u2014 your Copilot on the phone\n",
+        f"\U0001f3af Target: <b>{target}</b>",
+        f"\U0001f3ad Persona: <b>{persona}</b>",
+    ]
+    if not vscode_mode:
+        lines.append(f"\U0001f4c1 Workspace: <code>{active_workdir.name}</code>")
+        lines.append(f"\U0001f5c2 Session: <code>{sess}</code>")
+    lines.append(f"\U0001f9fe Mode: <b>{mode}</b>\n")
+    lines.append("Send a message or a voice note \u2014 or use the buttons:")
+    text = "\n".join(lines)
     b = InlineKeyboardBuilder()
     b.row(
         InlineKeyboardButton(text=f"\U0001f3af Target: {target}", callback_data="menu:target"),
     )
-    b.row(
-        InlineKeyboardButton(text="\U0001f4c1 Workspace", callback_data="menu:workspace"),
-        InlineKeyboardButton(text="\U0001f5c2 Sessions", callback_data="menu:sessions"),
-    )
+    if not vscode_mode:
+        b.row(
+            InlineKeyboardButton(text="\U0001f4c1 Workspace", callback_data="menu:workspace"),
+            InlineKeyboardButton(text="\U0001f5c2 Sessions", callback_data="menu:sessions"),
+        )
     b.row(
         InlineKeyboardButton(text="\U0001f3ad Persona", callback_data="menu:persona"),
         InlineKeyboardButton(text=f"\U0001f9fe Mode: {mode}", callback_data="menu:mode"),

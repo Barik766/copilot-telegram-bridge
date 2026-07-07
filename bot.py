@@ -23,12 +23,14 @@ import os
 import shutil
 import subprocess
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, Router, BaseMiddleware, F
 from aiogram.enums import ChatAction
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, Message
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
 logging.basicConfig(
@@ -69,6 +71,21 @@ REQUEST_TIMEOUT = _get_int("REQUEST_TIMEOUT", 900)
 ENABLE_VOICE = _get_bool("ENABLE_VOICE", True)
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small").strip() or "small"
 WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "").strip()
+
+# Telegram gets a short human summary while the agent still does the full work.
+SUMMARY_MODE = _get_bool("SUMMARY_MODE", True)
+DEFAULT_SUMMARY_INSTRUCTION = (
+    "You are answering the user on their PHONE via Telegram while they are away "
+    "from the computer. Do the FULL task with your tools (edit files, run "
+    "commands, use git). Then reply with a SHORT, warm, casual message in the "
+    "user's language \u2014 at most 3-4 sentences, no code blocks and no long file "
+    "or diff dumps. Say what you did and where; the full diff stays on the "
+    "machine for review in the editor. If you genuinely need a decision, ask one "
+    "short question instead."
+)
+SUMMARY_INSTRUCTION = (
+    os.getenv("SUMMARY_INSTRUCTION", "").strip() or DEFAULT_SUMMARY_INSTRUCTION
+)
 
 _DEFAULT_DENY = (
     "shell(rm),shell(rmdir),shell(rd),shell(del),shell(Remove-Item),"
@@ -131,9 +148,12 @@ COPILOT_ARGV = _resolve_copilot_argv()
 
 
 _session_started = False
+summary_enabled = SUMMARY_MODE
+active_workdir = WORKING_DIR
+active_resume_id: str | None = None
 
 
-def build_command(prompt: str, resume: bool) -> list[str]:
+def build_command(prompt: str) -> list[str]:
     args = list(COPILOT_ARGV) + ["-p", prompt, "--silent"]
     if COPILOT_MODEL:
         args += ["--model", COPILOT_MODEL]
@@ -141,22 +161,28 @@ def build_command(prompt: str, resume: bool) -> list[str]:
         args += ["--allow-all-tools", "--allow-all-paths"]
     for tool in DENY_TOOLS:
         args += ["--deny-tool", tool]
-    if resume:
+    if active_resume_id:
+        args += ["--resume", active_resume_id]
+    elif CONTINUE_SESSION and _session_started:
         args.append("--continue")
-    args += ["-C", str(WORKING_DIR)]
+    args += ["-C", str(active_workdir)]
     return args
 
 
 async def run_copilot(prompt: str) -> str:
     global _session_started
-    resume = CONTINUE_SESSION and _session_started
-    args = build_command(prompt, resume=resume)
-    log.info("copilot -p %r (resume=%s, deny=%d)", prompt[:80], resume, len(DENY_TOOLS))
+    log.info(
+        "copilot -p %r (ws=%s, resume=%s, summary=%s)",
+        prompt[:60], active_workdir.name, active_resume_id, summary_enabled,
+    )
+    if summary_enabled:
+        prompt = f"{prompt}\n\n---\n{SUMMARY_INSTRUCTION}"
+    args = build_command(prompt)
     proc = await asyncio.create_subprocess_exec(
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
-        cwd=str(WORKING_DIR),
+        cwd=str(active_workdir),
     )
     try:
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=REQUEST_TIMEOUT)
@@ -282,10 +308,14 @@ async def on_help(message: Message) -> None:
     await message.answer(
         "Send any text and it becomes a prompt for the Copilot CLI, running in "
         f"`{WORKING_DIR}`.\n\n"
-        "/start  \u2013 status banner\n"
-        "/status \u2013 current configuration\n"
-        "/new    \u2013 reset conversation context\n"
-        "/help   \u2013 this message",
+        "/start     \u2013 status banner\n"
+        "/workspace \u2013 pick a project folder\n"
+        "/sessions  \u2013 resume a saved session\n"
+        "/status    \u2013 current configuration\n"
+        "/new       \u2013 reset conversation context\n"
+        "/brief     \u2013 short phone-style replies (default)\n"
+        "/raw       \u2013 full Copilot output\n"
+        "/help      \u2013 this message",
     )
 
 
@@ -293,11 +323,13 @@ async def on_help(message: Message) -> None:
 async def on_status(message: Message) -> None:
     await message.answer(
         "Configuration:\n"
-        f"\u2022 working dir: {WORKING_DIR}\n"
+        f"\u2022 workspace: {active_workdir}\n"
+        f"\u2022 session: {active_resume_id or 'auto (latest)'}\n"
         f"\u2022 model: {COPILOT_MODEL or 'default'}\n"
         f"\u2022 allow-all-tools: {ALLOW_ALL_TOOLS}\n"
         f"\u2022 denied tools: {', '.join(DENY_TOOLS) or 'none'}\n"
         f"\u2022 timeout: {REQUEST_TIMEOUT}s\n"
+        f"\u2022 reply mode: {'brief' if summary_enabled else 'raw'}\n"
         f"\u2022 launcher: {' '.join(COPILOT_ARGV)}",
     )
 
@@ -307,6 +339,128 @@ async def on_new(message: Message) -> None:
     global _session_started
     _session_started = False
     await message.answer("\U0001f504 Fresh conversation \u2014 context reset.")
+
+
+@router.message(Command("brief"))
+async def on_brief(message: Message) -> None:
+    global summary_enabled
+    summary_enabled = True
+    await message.answer(
+        "\U0001f4f1 Brief mode \u2014 short phone-style summaries (full work still done)."
+    )
+
+
+@router.message(Command("raw"))
+async def on_raw(message: Message) -> None:
+    global summary_enabled
+    summary_enabled = False
+    await message.answer("\U0001f4c4 Raw mode \u2014 full Copilot output.")
+
+
+COPILOT_SESSIONS_DIR = Path.home() / ".copilot" / "session-state"
+
+
+def _session_title(session_dir: Path) -> str:
+    try:
+        files = sorted(
+            (p for p in session_dir.iterdir() if p.is_file()),
+            key=lambda p: p.stat().st_size,
+            reverse=True,
+        )
+        for f in files:
+            try:
+                with f.open("r", encoding="utf-8", errors="ignore") as fh:
+                    for line in fh:
+                        if '"user' not in line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except Exception:
+                            continue
+                        if str(obj.get("type", "")).startswith("user"):
+                            content = obj.get("data", {}).get("content", "")
+                            if isinstance(content, list):
+                                content = " ".join(
+                                    p.get("text", "") if isinstance(p, dict) else str(p)
+                                    for p in content
+                                )
+                            content = str(content).split("\n\n---")[0].strip()
+                            if content:
+                                return content[:48]
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return "(untitled)"
+
+
+def list_sessions(limit: int = 8) -> list[tuple[str, str, float]]:
+    if not COPILOT_SESSIONS_DIR.is_dir():
+        return []
+    dirs = [d for d in COPILOT_SESSIONS_DIR.iterdir() if d.is_dir()]
+    dirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+    return [(d.name, _session_title(d), d.stat().st_mtime) for d in dirs[:limit]]
+
+
+@router.message(Command("sessions"))
+async def on_sessions(message: Message) -> None:
+    loop = asyncio.get_running_loop()
+    sessions = await loop.run_in_executor(None, list_sessions, 8)
+    if not sessions:
+        await message.answer("No saved sessions yet \u2014 just send a message to start one.")
+        return
+    kb = InlineKeyboardBuilder()
+    for sid, title, mtime in sessions:
+        ts = datetime.fromtimestamp(mtime).strftime("%m-%d %H:%M")
+        kb.button(text=f"{title} \u00b7 {ts}", callback_data=f"sess:{sid}")
+    kb.button(text="\U0001f195 New session", callback_data="sess:new")
+    kb.adjust(1)
+    await message.answer("Pick a session to resume:", reply_markup=kb.as_markup())
+
+
+@router.callback_query(F.data.startswith("sess:"))
+async def on_pick_session(cb: CallbackQuery) -> None:
+    global active_resume_id, _session_started
+    val = cb.data.split(":", 1)[1]
+    if val == "new":
+        active_resume_id = None
+        _session_started = False
+        await cb.answer("New session")
+        await cb.message.answer("\U0001f195 New session \u2014 send your first message.")
+    else:
+        active_resume_id = val
+        await cb.answer("Resumed")
+        await cb.message.answer(
+            f"\u25b6\ufe0f Resumed {val[:8]}. Ask away, e.g. \u00abна \u0447\u0451м остановились?\u00bb"
+        )
+
+
+@router.message(Command("workspace"))
+async def on_workspace(message: Message) -> None:
+    kb = InlineKeyboardBuilder()
+    kb.button(text=f"\U0001f4c1 {WORKING_DIR.name} (all)", callback_data="ws:*")
+    if WORKING_DIR.is_dir():
+        subdirs = sorted(
+            d for d in WORKING_DIR.iterdir()
+            if d.is_dir() and not d.name.startswith(".")
+        )
+        for d in subdirs[:20]:
+            kb.button(text=d.name, callback_data=f"ws:{d.name}")
+    kb.adjust(1)
+    await message.answer("Pick a workspace:", reply_markup=kb.as_markup())
+
+
+@router.callback_query(F.data.startswith("ws:"))
+async def on_pick_workspace(cb: CallbackQuery) -> None:
+    global active_workdir, active_resume_id, _session_started
+    name = cb.data.split(":", 1)[1]
+    active_workdir = WORKING_DIR if name == "*" else (WORKING_DIR / name)
+    active_resume_id = None
+    _session_started = False
+    await cb.answer("Workspace set")
+    await cb.message.answer(
+        f"\U0001f4c1 Workspace: {active_workdir}\nNow /sessions or just send a message."
+    )
 
 
 @router.message(F.voice | F.audio)

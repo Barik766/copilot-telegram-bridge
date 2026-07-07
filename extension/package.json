@@ -1,0 +1,78 @@
+{
+  "name": "copilot-telegram-bridge-ext",
+  "displayName": "Copilot Telegram Bridge",
+  "description": "Drive the VS Code Copilot chat from Telegram.",
+  "version": "0.0.1",
+  "publisher": "barik766",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "copilotTgBridge.toggle",
+        "title": "Copilot TG Bridge: Toggle phone connection for this window"
+      },
+      {
+        "command": "copilotTgBridge.testInject",
+        "title": "Copilot TG Bridge: Test Inject Prompt into Chat"
+      }
+    ],
+    "configuration": {
+      "title": "Copilot Telegram Bridge",
+      "properties": {
+        "copilotTgBridge.port": {
+          "type": "number",
+          "default": 8765,
+          "description": "Local HTTP port the bridge listens on (127.0.0.1 only)."
+        },
+        "copilotTgBridge.token": {
+          "type": "string",
+          "default": "",
+          "description": "Shared secret; the Telegram bot must send the same token. Empty = no auth (localhost only)."
+        },
+        "copilotTgBridge.notifyUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:8766/notify",
+          "description": "Where the agent's notify_telegram messages are POSTed (the Python bot's notify server)."
+        }
+      }
+    },
+    "languageModelTools": [
+      {
+        "name": "notify_telegram",
+        "displayName": "Notify Telegram",
+        "modelDescription": "Send a short status update or a question to the user's Telegram (their phone). Use it to report progress, ask a yes/no or A-or-B decision, or say the task is done. Keep it to 1-3 sentences, no code blocks.",
+        "toolReferenceName": "notifyTelegram",
+        "canBeReferencedInPrompt": true,
+        "icon": "$(bell)",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string",
+              "description": "The short message to send to the user's phone."
+            }
+          },
+          "required": ["message"]
+        }
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.4.5"
+  }
+}

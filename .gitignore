@@ -18,3 +18,7 @@ env/
 .DS_Store
 .vscode/
 .idea/
+
+# VS Code extension (Node/TypeScript)
+extension/node_modules/
+extension/out/

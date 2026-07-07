@@ -105,6 +105,54 @@ python bot.py
 Then message your bot on Telegram. Try: *"list the files here and summarize the
 project"*, or just tap `☰ Menu` to explore workspaces, sessions and modes.
 
+## Run it on startup (Windows, no admin)
+
+To keep the bot always on without babysitting a terminal, two tiny helpers are
+included:
+
+- `run-bot.cmd` — starts `bot.py` from its own folder and appends output to
+  `bot.log`.
+- `start-bot.vbs` — runs that batch **hidden** (no console window) and restarts
+  the bot a few seconds after it ever exits or crashes.
+
+Register it to launch at logon by dropping a shortcut into your Startup folder
+(runs as your user, no elevation needed):
+
+```powershell
+$startup = [Environment]::GetFolderPath('Startup')
+$repo    = "$PWD"
+$ws  = New-Object -ComObject WScript.Shell
+$lnk = $ws.CreateShortcut((Join-Path $startup 'CopilotTelegramBridge.lnk'))
+$lnk.TargetPath       = 'wscript.exe'
+$lnk.Arguments        = '"' + (Join-Path $repo 'start-bot.vbs') + '"'
+$lnk.WorkingDirectory = $repo
+$lnk.WindowStyle      = 7            # minimized/hidden
+$lnk.Save()
+```
+
+Now the Telegram side comes up automatically after every login. In VS Code mode
+you still click **📱 Phone: ON** in the window you want to drive — that stays a
+deliberate one-tap choice.
+
+Useful commands:
+
+```powershell
+# tail the log
+Get-Content .\bot.log -Tail 20 -Wait
+
+# stop it now (kill the keep-alive first, then the bot)
+Get-Process wscript -EA SilentlyContinue | Stop-Process -Force
+Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+  Where-Object { $_.CommandLine -like '*bot.py*' } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+
+# disable auto-start
+Remove-Item "$([Environment]::GetFolderPath('Startup'))\CopilotTelegramBridge.lnk"
+```
+
+> While auto-start is active, don't also run `python bot.py` by hand — two
+> pollers fight over Telegram updates. Use the one that's already running.
+
 ## Commands & menu
 
 | Command | Does |

@@ -244,6 +244,20 @@ ports and token matching on both sides:
 | `NOTIFY_PORT=8766` | `copilotTgBridge.notifyUrl = http://127.0.0.1:8766/notify` |
 | `BRIDGE_TOKEN=<secret>` | `copilotTgBridge.token = <same secret>` |
 
+`BRIDGE_TOKEN` is **optional but recommended**. Both local servers already bind
+to `127.0.0.1`, so nothing on your network can reach them — but any *local*
+process (or a malicious web page hitting `http://127.0.0.1` from your browser)
+still could. Since `/inject` drives an agent that runs commands, a shared secret
+closes that gap: with a token set, both sides reject any request that doesn't
+carry it (`401`). Generate one and paste the same value on both sides:
+
+```powershell
+python -c "import secrets; print(secrets.token_hex(24))"
+```
+
+Leave it empty to disable auth (localhost-only). The token lives in `.env` and
+your VS Code settings — never commit it.
+
 ### 5. Approve the notify tool once
 
 The first time the agent calls `notify_telegram`, VS Code shows a confirmation —
@@ -272,6 +286,9 @@ Telegram messages. Treat it accordingly:
   or system root.
 - The **denylist** blocks destructive commands even in `--allow-all-tools` mode.
 - **Never send secrets** through the chat.
+- **Set a `BRIDGE_TOKEN`** in VS Code mode. The bridge's local `/inject` and
+  `/notify` endpoints bind to `127.0.0.1`, but a token also blocks other local
+  processes and browser-based requests to `localhost` from driving the agent.
 - For maximum isolation, run inside a VM/container, or use Copilot's own
   `/sandbox`. Set `ALLOW_ALL_TOOLS=false` for an approval-per-action posture, or
   add `--deny-tool='write'` (via a code tweak) for a read-only assistant.

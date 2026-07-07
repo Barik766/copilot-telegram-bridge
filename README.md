@@ -7,7 +7,7 @@ Send a message to your own private bot and the real `copilot` agent runs
 **locally**, inside a project folder you choose, and streams the result back to
 your chat. Step away for coffee, keep shipping from your phone.
 
-![demo](assets/demo.gif)
+![Demo: controlling GitHub Copilot from a phone over Telegram while the agent works in a local VS Code Copilot Chat session](assets/demo.gif)
 
 ---
 
@@ -236,6 +236,38 @@ Telegram messages. Treat it accordingly:
 - 🚦 Per-hour request / AI-credit cap
 - ✅ Optional Telegram approval prompt for individual tool calls
 - 🐧 Linux/macOS launch scripts
+
+## FAQ
+
+### Can I control GitHub Copilot from my phone?
+
+Yes. This is a self-hosted Telegram bot that drives the official GitHub Copilot
+agent on your own machine, so you can send prompts and get results from your
+phone while the real agent edits files and runs commands locally.
+
+### Does it work with the Copilot CLI and with VS Code?
+
+Both. By default it spawns the headless GitHub Copilot CLI. With the optional
+companion extension it can instead send your Telegram prompts straight into a
+live VS Code Copilot Chat session and ping your phone back when the agent is
+done.
+
+### Is it safe to let an AI coding agent run commands from Telegram?
+
+It is a real remote-execution surface, so the bridge is single-user by design:
+only your Telegram id is served, the agent is sandboxed to one project folder,
+and a destructive-command denylist is always enforced. Read the security section
+before exposing it.
+
+### Do I need an API key to use voice messages?
+
+No. Voice notes are transcribed locally with Whisper (`faster-whisper`); nothing
+leaves your machine and no speech-to-text API key is required.
+
+### Which platforms are supported?
+
+It is built and tested Windows-first with PowerShell. Node.js 20+ and Python
+3.10+ are required; Linux/macOS launch scripts are on the roadmap.
 
 ## Disclaimer
 
